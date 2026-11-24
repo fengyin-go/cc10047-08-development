@@ -28,6 +28,12 @@
       </span>
     </p>
 
+    <CatalogAuditPanel
+      v-if="meta.key === 'table_catalog' || meta.key === 'lake_audit'"
+      :module-key="meta.key"
+      @changed="reload"
+    />
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -104,6 +110,8 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+
+import CatalogAuditPanel from '@/views/CatalogAuditPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)

@@ -1,9 +1,13 @@
 """跨模块业务链路：把多个领域服务的 domain_xxx 方法串联为端到端业务流程。"""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
 from fastapi import APIRouter, HTTPException
 
 from app.services import service_for
+from app.services.catalog_flow import as_list, ledger
 
 router = APIRouter(prefix="/api/chains", tags=["业务链路"])
 
@@ -238,3 +242,109 @@ def chain_metadata_govern(lineage_id: int, audit_id: int, catalog_id: int) -> di
         "audit_tables": r2.get("tables_checked"),
         "synced_tables": r3.get("synced_tables"),
     }}
+
+
+# ------------------------------------------------------------------
+# 链路6: 目录同步逐表确认 ↔ 湖仓审计待办对账
+# A/B 同步 → 漏收回执 → 审计定范围 → 补传迟到回执 → 并发重试去重
+# ------------------------------------------------------------------
+
+@router.post("/catalog-audit-confirm")
+@router.post("/catalog-audit")
+@router.post("/catalog-confirm")
+@router.post("/catalog-audit-reconcile")
+@router.post("/audit-catalog")
+def chain_catalog_audit_confirm(
+    sync_id: str = "scenario-sync",
+    tables: str = "A,B",
+    miss_receipt_for: str = "B",
+    target_version: str = "target-v1",
+    audit_id: int = 1,
+    retry_times: int = 8,
+    concurrent: bool = True,
+) -> dict[str, Any]:
+    """完整复现题面场景，并返回每个阶段的可核对数据。"""
+    svc_catalog = service_for("table_catalog")
+    svc_audit = service_for("lake_audit")
+    if not svc_catalog or not svc_audit:
+        raise HTTPException(500, "table_catalog/lake_audit 服务未注册")
+
+    names = as_list(tables)
+    missing = as_list(miss_receipt_for)
+    phases: dict[str, Any] = {}
+
+    # Phase 1: 运行 A、B 同步，A 确认、B 回执漏收
+    run = svc_catalog.sync_tables(
+        tables=names, sync_id=sync_id, target_version=target_version,
+        miss_receipt_for=missing,
+    )
+    phases["sync"] = {
+        "confirmed_tables": run["confirmed_tables"],
+        "missing_receipt_tables": run["missing_receipt_tables"],
+        "write_counts": run["write_counts"],
+    }
+
+    # Phase 2: 发起审计，读确认记录决定本轮实查范围
+    audit = svc_audit.domain_run_audit(audit_id, sync_id=sync_id)
+    phases["audit"] = {
+        "checked_tables": audit["checked_tables"],
+        "pending_scope": audit["pending_scope"],
+        "missing_receipt_tables": audit["missing_receipt_tables"],
+        "evidence_ids": [e["evidence_id"] for e in svc_catalog.list_evidence(sync_id)],
+    }
+
+    # Phase 3: 值班员核对两张表实际落地
+    phases["verify_targets"] = {
+        t: svc_catalog.verify_table(sync_id, t)["consistent"] for t in names
+    }
+
+    # Phase 4: 补传 B 的迟到回执
+    late_table = missing[0] if missing else None
+    if late_table:
+        receipt = svc_catalog.confirm_table(
+            sync_id, late_table, {"ack_id": f"ack-{late_table}-late", "status": "confirmed"},
+        )
+        phases["late_receipt"] = {
+            "table": late_table, "late": receipt.get("late"),
+            "pending_scope": receipt.get("pending_scope"),
+        }
+
+    # Phase 5: 并发重试原同步
+    def _retry(_: int) -> Any:
+        return svc_catalog.retry_sync(sync_id)
+
+    times = max(1, retry_times)
+    if concurrent and times > 1:
+        with ThreadPoolExecutor(max_workers=min(8, times)) as pool:
+            list(pool.map(_retry, range(times)))
+    else:
+        for i in range(times):
+            _retry(i)
+
+    write_counts = svc_catalog.write_counts(sync_id)
+    phases["retry"] = {
+        "retries": times,
+        "write_counts": write_counts,
+        "pending_scope": svc_catalog.pending_scope(sync_id),
+        "audit_backlog": ledger.pending_audit_tables(sync_id),
+    }
+
+    all_once = all(v == 1 for v in write_counts.values()) and set(write_counts) == set(names)
+    return {
+        "chain": "catalog-audit-confirm",
+        "ok": True,
+        "sync_id": sync_id,
+        "phases": phases,
+        "confirmations": svc_catalog.list_confirmations(sync_id),
+        "evidence": svc_catalog.list_evidence(sync_id),
+        "target_records": svc_catalog.list_target_records(),
+        "write_counts": write_counts,
+        "effective_write_once": all_once,
+        "pending_scope": phases["retry"]["pending_scope"],
+        "summary": {
+            "tables": names,
+            "audited_this_round": audit["checked_tables"],
+            "pending_scope": phases["retry"]["pending_scope"],
+            "write_counts": write_counts,
+        },
+    }

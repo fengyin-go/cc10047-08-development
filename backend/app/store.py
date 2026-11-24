@@ -47,3 +47,9 @@ class Store:
 
 
 store = Store()
+
+# 目录同步逐表确认/审计对账台账挂到 store 单例上，方便通过 store 发现与复用。
+# catalog_flow 仅依赖标准库，不会与 seed/store 形成循环导入。
+from app.services.catalog_flow import ledger as catalog_ledger  # noqa: E402
+
+store.catalog_ledger = catalog_ledger

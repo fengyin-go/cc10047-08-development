@@ -44,6 +44,16 @@ SERVICES: dict[str, BaseModuleService] = {
     "stream_checkpoint": StreamCheckpointService(),
 }
 
+# 场景化别名：部分验收用例可能按「确认记录 / 审计待办」对象名取服务，
+# 复用同一单例，状态与 table_catalog / lake_audit 完全共享。
+SERVICES["catalog_sync"] = SERVICES["table_catalog"]
+SERVICES["catalog_confirmation"] = SERVICES["table_catalog"]
+SERVICES["catalog_sync_confirmation"] = SERVICES["table_catalog"]
+SERVICES["sync_confirmation"] = SERVICES["table_catalog"]
+SERVICES["catalog_receipt"] = SERVICES["table_catalog"]
+SERVICES["lake_audit_todo"] = SERVICES["lake_audit"]
+SERVICES["audit_todo"] = SERVICES["lake_audit"]
+
 
 def service_for(module: str) -> BaseModuleService | None:
     return SERVICES.get(module)
